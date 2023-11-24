@@ -92,16 +92,16 @@ type StreamReplaced struct{}
 type TempBanReason int
 
 const (
-	TempBanBlockedByUsers         TempBanReason = 101
-	TempBanSentToTooManyPeople    TempBanReason = 102
+	TempBanSentToTooManyPeople    TempBanReason = 101
+	TempBanBlockedByUsers         TempBanReason = 102
 	TempBanCreatedTooManyGroups   TempBanReason = 103
 	TempBanSentTooManySameMessage TempBanReason = 104
 	TempBanBroadcastList          TempBanReason = 106
 )
 
 var tempBanReasonMessage = map[TempBanReason]string{
-	TempBanBlockedByUsers:         "too many people blocked you",
 	TempBanSentToTooManyPeople:    "you sent too many messages to people who don't have you in their address books",
+	TempBanBlockedByUsers:         "too many people blocked you",
 	TempBanCreatedTooManyGroups:   "you created too many groups with people who don't have you in their address books",
 	TempBanSentTooManySameMessage: "you sent the same message to too many people",
 	TempBanBroadcastList:          "you sent too many messages to a broadcast list",
@@ -119,14 +119,14 @@ func (tbr TempBanReason) String() string {
 // TemporaryBan is emitted when there's a connection failure with the ConnectFailureTempBanned reason code.
 type TemporaryBan struct {
 	Code   TempBanReason
-	Expire time.Time
+	Expire time.Duration
 }
 
 func (tb *TemporaryBan) String() string {
-	if tb.Expire.IsZero() {
+	if tb.Expire == 0 {
 		return fmt.Sprintf("You've been temporarily banned: %v", tb.Code)
 	}
-	return fmt.Sprintf("You've been temporarily banned: %v. The ban expires at %v", tb.Code, tb.Expire)
+	return fmt.Sprintf("You've been temporarily banned: %v. The ban expires in %v", tb.Code, tb.Expire)
 }
 
 // ConnectFailureReason is an error code included in connection failure events.
@@ -142,6 +142,11 @@ const (
 	ConnectFailureBadUserAgent   ConnectFailureReason = 409
 
 	// 400, 500 and 501 are also existing codes, but the meaning is unknown
+
+	// 503 doesn't seem to be included in the web app JS with the other codes, and it's very rare,
+	// but does happen after a 503 stream error sometimes.
+
+	ConnectFailureServiceUnavailable ConnectFailureReason = 503
 )
 
 var connectFailureReasonMessage = map[ConnectFailureReason]string{
@@ -171,8 +176,9 @@ func (cfr ConnectFailureReason) String() string {
 //
 // Known reasons are handled internally and emitted as different events (e.g. LoggedOut and TemporaryBan).
 type ConnectFailure struct {
-	Reason ConnectFailureReason
-	Raw    *waBinary.Node
+	Reason  ConnectFailureReason
+	Message string
+	Raw     *waBinary.Node
 }
 
 // ClientOutdated is emitted when the WhatsApp server rejects the connection with the ConnectFailureClientOutdated code.
@@ -194,6 +200,13 @@ type HistorySync struct {
 	Data *waProto.HistorySync
 }
 
+type DecryptFailMode string
+
+const (
+	DecryptFailShow DecryptFailMode = ""
+	DecryptFailHide DecryptFailMode = "hide"
+)
+
 // UndecryptableMessage is emitted when receiving a new message that failed to decrypt.
 //
 // The library will automatically ask the sender to retry. If the sender resends the message,
@@ -206,6 +219,8 @@ type UndecryptableMessage struct {
 	// IsUnavailable is true if the recipient device didn't send a ciphertext to this device at all
 	// (as opposed to sending a ciphertext, but the ciphertext not being decryptable).
 	IsUnavailable bool
+
+	DecryptFailMode DecryptFailMode
 }
 
 // Message is emitted when receiving a new message.
@@ -218,6 +233,13 @@ type Message struct {
 	IsViewOnceV2          bool // True if the message was unwrapped from a ViewOnceMessage
 	IsDocumentWithCaption bool // True if the message was unwrapped from a DocumentWithCaptionMessage
 	IsEdit                bool // True if the message was unwrapped from an EditedMessage
+
+	// If this event was parsed from a WebMessageInfo (i.e. from a history sync or unavailable message request), the source data is here.
+	SourceWebMsg *waProto.WebMessageInfo
+	// If this event is a response to an unavailable message request, the request ID is here.
+	UnavailableRequestID types.MessageID
+	// If the message was re-requested from the sender, this is the number of retries it took.
+	RetryCount int
 
 	// The raw message struct. This is the raw unmodified data, which means the actual message might
 	// be wrapped in DeviceSentMessage, EphemeralMessage or ViewOnceMessage.
@@ -351,6 +373,11 @@ type GroupInfo struct {
 	Locked    *types.GroupLocked    // Group locked status change (can only admins edit group info?)
 	Announce  *types.GroupAnnounce  // Group announce status change (can only admins send messages?)
 	Ephemeral *types.GroupEphemeral // Disappearing messages change
+
+	Delete *types.GroupDelete
+
+	Link   *types.GroupLinkChange
+	Unlink *types.GroupLinkChange
 
 	NewInviteLink *string // Group invite link change
 

@@ -9,7 +9,6 @@ package whatsmeow
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -29,6 +28,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	"go.mau.fi/whatsmeow/util/keys"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"go.mau.fi/whatsmeow/util/randbytes"
 )
 
 // EventHandler is a function that can handle events from WhatsApp.
@@ -64,6 +64,10 @@ type Client struct {
 	// EmitAppStateEventsOnFullSync can be set to true if you want to get app state events emitted
 	// even when re-syncing the whole state.
 	EmitAppStateEventsOnFullSync bool
+
+	AutomaticMessageRerequestFromPhone bool
+	pendingPhoneRerequests             map[types.MessageID]context.CancelFunc
+	pendingPhoneRerequestsLock         sync.RWMutex
 
 	appStateProc     *appstate.Processor
 	appStateSyncLock sync.Mutex
@@ -114,10 +118,23 @@ type Client struct {
 	// If it returns false, the accepting will be cancelled and the retry receipt will be ignored.
 	PreRetryCallback func(receipt *events.Receipt, id types.MessageID, retryCount int, msg *waProto.Message) bool
 
+	// PrePairCallback is called before pairing is completed. If it returns false, the pairing will be cancelled and
+	// the client will disconnect.
+	PrePairCallback func(jid types.JID, platform, businessName string) bool
+
 	// Should untrusted identity errors be handled automatically? If true, the stored identity and existing signal
 	// sessions will be removed on untrusted identity errors, and an events.IdentityChange will be dispatched.
 	// If false, decrypting a message from untrusted devices will fail.
 	AutoTrustIdentity bool
+
+	// Should sending to own devices be skipped when sending broadcasts?
+	// This works around a bug in the WhatsApp android app where it crashes if you send a status message from a linked device.
+	DontSendSelfBroadcast bool
+
+	// Should SubscribePresence return an error if no privacy token is stored for the user?
+	ErrorOnSubscribePresenceWithoutToken bool
+
+	phoneLinkingCache *phoneLinkingCache
 
 	uniqueID  string
 	idCounter uint32
@@ -150,8 +167,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 	if log == nil {
 		log = waLog.Noop
 	}
-	randomBytes := make([]byte, 2)
-	_, _ = rand.Read(randomBytes)
+	uniqueIDPrefix := randbytes.Make(2)
 	cli := &Client{
 		http: &http.Client{
 			Transport: (http.DefaultTransport.(*http.Transport)).Clone(),
@@ -161,7 +177,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		Log:             log,
 		recvLog:         log.Sub("Recv"),
 		sendLog:         log.Sub("Send"),
-		uniqueID:        fmt.Sprintf("%d.%d-", randomBytes[0], randomBytes[1]),
+		uniqueID:        fmt.Sprintf("%d.%d-", uniqueIDPrefix[0], uniqueIDPrefix[1]),
 		responseWaiters: make(map[string]chan<- *waBinary.Node),
 		eventHandlers:   make([]wrappedEventHandler, 0, 1),
 		messageRetries:  make(map[string]int),
@@ -179,8 +195,11 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		GetMessageForRetry:     func(requester, to types.JID, id types.MessageID) *waProto.Message { return nil },
 		appStateKeyRequests:    make(map[string]time.Time),
 
-		EnableAutoReconnect: true,
-		AutoTrustIdentity:   true,
+		pendingPhoneRerequests: make(map[types.MessageID]context.CancelFunc),
+
+		EnableAutoReconnect:   true,
+		AutoTrustIdentity:     true,
+		DontSendSelfBroadcast: true,
 	}
 	cli.nodeHandlers = map[string]nodeHandler{
 		"message":      cli.handleEncryptedMessage,
@@ -248,6 +267,14 @@ func (cli *Client) closeSocketWaitChan() {
 	close(cli.socketWait)
 	cli.socketWait = make(chan struct{})
 	cli.socketLock.Unlock()
+}
+
+func (cli *Client) getOwnID() types.JID {
+	id := cli.Store.ID
+	if id == nil {
+		return types.EmptyJID
+	}
+	return *id
 }
 
 func (cli *Client) WaitForConnection(timeout time.Duration) bool {
@@ -392,7 +419,8 @@ func (cli *Client) unlockedDisconnect() {
 // Note that this will not emit any events. The LoggedOut event is only used for external logouts
 // (triggered by the user from the main device or by WhatsApp servers).
 func (cli *Client) Logout() error {
-	if cli.Store.ID == nil {
+	ownID := cli.getOwnID()
+	if ownID.IsEmpty() {
 		return ErrNotLoggedIn
 	}
 	_, err := cli.sendIQ(infoQuery{
@@ -402,7 +430,7 @@ func (cli *Client) Logout() error {
 		Content: []waBinary.Node{{
 			Tag: "remove-companion-device",
 			Attrs: waBinary.Attrs{
-				"jid":    *cli.Store.ID,
+				"jid":    ownID,
 				"reason": "user_initiated",
 			},
 		}},
@@ -526,17 +554,46 @@ func (cli *Client) handleFrame(data []byte) {
 				cli.handlerQueue <- node
 			}()
 		}
-	} else {
+	} else if node.Tag != "ack" {
 		cli.Log.Debugf("Didn't handle WhatsApp node %s", node.Tag)
 	}
 }
 
+func stopAndDrainTimer(timer *time.Timer) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+}
+
 func (cli *Client) handlerQueueLoop(ctx context.Context) {
+	timer := time.NewTimer(5 * time.Minute)
+	stopAndDrainTimer(timer)
+	cli.Log.Debugf("Starting handler queue loop")
 	for {
 		select {
 		case node := <-cli.handlerQueue:
-			cli.nodeHandlers[node.Tag](node)
+			doneChan := make(chan struct{}, 1)
+			go func() {
+				start := time.Now()
+				cli.nodeHandlers[node.Tag](node)
+				duration := time.Since(start)
+				doneChan <- struct{}{}
+				if duration > 5*time.Second {
+					cli.Log.Warnf("Node handling took %s for %s", duration, node.XMLString())
+				}
+			}()
+			timer.Reset(5 * time.Minute)
+			select {
+			case <-doneChan:
+				stopAndDrainTimer(timer)
+			case <-timer.C:
+				cli.Log.Warnf("Node handling is taking long for %s - continuing in background", node.XMLString())
+			}
 		case <-ctx.Done():
+			cli.Log.Debugf("Closing handler queue loop")
 			return
 		}
 	}
@@ -588,6 +645,13 @@ func (cli *Client) dispatchEvent(evt interface{}) {
 //		yourNormalEventHandler(evt)
 //	}
 func (cli *Client) ParseWebMessage(chatJID types.JID, webMsg *waProto.WebMessageInfo) (*events.Message, error) {
+	var err error
+	if chatJID.IsEmpty() {
+		chatJID, err = types.ParseJID(webMsg.GetKey().GetRemoteJid())
+		if err != nil {
+			return nil, fmt.Errorf("no chat JID provided and failed to parse remote JID: %w", err)
+		}
+	}
 	info := types.MessageInfo{
 		MessageSource: types.MessageSource{
 			Chat:     chatJID,
@@ -598,9 +662,11 @@ func (cli *Client) ParseWebMessage(chatJID types.JID, webMsg *waProto.WebMessage
 		PushName:  webMsg.GetPushName(),
 		Timestamp: time.Unix(int64(webMsg.GetMessageTimestamp()), 0),
 	}
-	var err error
 	if info.IsFromMe {
-		info.Sender = cli.Store.ID.ToNonAD()
+		info.Sender = cli.getOwnID().ToNonAD()
+		if info.Sender.IsEmpty() {
+			return nil, ErrNotLoggedIn
+		}
 	} else if chatJID.Server == types.DefaultUserServer {
 		info.Sender = chatJID
 	} else if webMsg.GetParticipant() != "" {
@@ -614,8 +680,9 @@ func (cli *Client) ParseWebMessage(chatJID types.JID, webMsg *waProto.WebMessage
 		return nil, fmt.Errorf("failed to parse sender of message %s: %v", info.ID, err)
 	}
 	evt := &events.Message{
-		RawMessage: webMsg.GetMessage(),
-		Info:       info,
+		RawMessage:   webMsg.GetMessage(),
+		SourceWebMsg: webMsg,
+		Info:         info,
 	}
 	evt.UnwrapRaw()
 	return evt, nil

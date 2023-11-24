@@ -7,7 +7,6 @@
 package whatsmeow
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
 	"time"
@@ -19,6 +18,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	"go.mau.fi/whatsmeow/util/gcmutil"
 	"go.mau.fi/whatsmeow/util/hkdfutil"
+	"go.mau.fi/whatsmeow/util/randbytes"
 )
 
 type MsgSecretType string
@@ -94,7 +94,10 @@ func (cli *Client) decryptMsgSecret(msg *events.Message, useCase MsgSecretType, 
 }
 
 func (cli *Client) encryptMsgSecret(chat, origSender types.JID, origMsgID types.MessageID, useCase MsgSecretType, plaintext []byte) (ciphertext, iv []byte, err error) {
-	ownID := *cli.Store.ID
+	ownID := cli.getOwnID()
+	if ownID.IsEmpty() {
+		return nil, nil, ErrNotLoggedIn
+	}
 
 	baseEncKey, err := cli.Store.MsgSecrets.GetMessageSecret(chat, origSender, origMsgID)
 	if err != nil {
@@ -104,11 +107,7 @@ func (cli *Client) encryptMsgSecret(chat, origSender types.JID, origMsgID types.
 	}
 	secretKey, additionalData := generateMsgSecretKey(useCase, ownID, origMsgID, origSender, baseEncKey)
 
-	iv = make([]byte, 12)
-	_, err = rand.Read(iv)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to generate iv: %w", err)
-	}
+	iv = randbytes.Make(12)
 	ciphertext, err = gcmutil.Encrypt(secretKey, iv, plaintext, additionalData)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to encrypt secret message: %w", err)
@@ -129,7 +128,7 @@ func (cli *Client) encryptMsgSecret(chat, origSender types.JID, origMsgID types.
 //	}
 func (cli *Client) DecryptReaction(reaction *events.Message) (*waProto.ReactionMessage, error) {
 	encReaction := reaction.Message.GetEncReactionMessage()
-	if encReaction != nil {
+	if encReaction == nil {
 		return nil, ErrNotEncryptedReactionMessage
 	}
 	plaintext, err := cli.decryptMsgSecret(reaction, EncSecretReaction, encReaction, encReaction.GetTargetMessageKey())
@@ -208,7 +207,7 @@ func HashPollOptions(optionNames []string) [][]byte {
 //			fmt.Println(":(", err)
 //			return
 //		}
-//		resp, err := cli.SendMessage(context.Background(), evt.Info.Chat, "", pollVoteMsg)
+//		resp, err := cli.SendMessage(context.Background(), evt.Info.Chat, pollVoteMsg)
 //	}
 func (cli *Client) BuildPollVote(pollInfo *types.MessageInfo, optionNames []string) (*waProto.Message, error) {
 	pollUpdate, err := cli.EncryptPollVote(pollInfo, &waProto.PollVoteMessage{
@@ -220,13 +219,9 @@ func (cli *Client) BuildPollVote(pollInfo *types.MessageInfo, optionNames []stri
 // BuildPollCreation builds a poll creation message with the given poll name, options and maximum number of selections.
 // The built message can be sent normally using Client.SendMessage.
 //
-//	resp, err := cli.SendMessage(context.Background(), chat, "", cli.BuildPollCreation("meow?", []string{"yes", "no"}, 1))
+//	resp, err := cli.SendMessage(context.Background(), chat, cli.BuildPollCreation("meow?", []string{"yes", "no"}, 1))
 func (cli *Client) BuildPollCreation(name string, optionNames []string, selectableOptionCount int) *waProto.Message {
-	msgSecret := make([]byte, 32)
-	_, err := rand.Read(msgSecret)
-	if err != nil {
-		panic(err)
-	}
+	msgSecret := randbytes.Make(32)
 	if selectableOptionCount < 0 || selectableOptionCount > len(optionNames) {
 		selectableOptionCount = 0
 	}
